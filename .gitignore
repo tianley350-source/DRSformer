@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+# Generated training artifacts.
+experiments/*
+!experiments/README.md
+tb_logger/

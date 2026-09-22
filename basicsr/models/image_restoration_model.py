@@ -157,8 +157,21 @@ class ImageCleanModel(BaseModel):
         loss_dict = OrderedDict()
         # pixel loss
         l_pix = 0.
-        for pred in preds:
-            l_pix += self.cri_pix(pred, self.gt)
+        intermediate_weights = self.opt['train'].get('intermediate_weights')
+        if intermediate_weights is None:
+            loss_weights = [1.0] * len(preds)
+        else:
+            if len(intermediate_weights) < len(preds):
+                raise ValueError(
+                    f'intermediate_weights has {len(intermediate_weights)} '
+                    f'entries, but the network returned {len(preds)} predictions.')
+            # Random-depth training may return fewer intermediate predictions.
+            # Keep the final configured weight for the full decoder output.
+            loss_weights = (list(intermediate_weights[:len(preds) - 1]) +
+                            [intermediate_weights[-1]])
+
+        for weight, pred in zip(loss_weights, preds):
+            l_pix += float(weight) * self.cri_pix(pred, self.gt)
 
         loss_dict['l_pix'] = l_pix
 

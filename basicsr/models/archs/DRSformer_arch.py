@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pdb import set_trace as stx
 import numbers
+import random
 
 from einops import rearrange
 
@@ -385,6 +386,117 @@ class Upsample(nn.Module):
     def forward(self, x):
         return self.body(x)
 
+
+class RecurrentLatentCore(nn.Module):
+    """Shared recurrent latent blocks used by LoopDRSformer.
+
+    The pre/post blocks remain unshared. Only ``shared_core`` is executed more
+    than once, so parameter count and effective depth can be controlled
+    independently.
+    """
+
+    def __init__(self,
+                 dim,
+                 num_heads,
+                 ffn_expansion_factor,
+                 bias,
+                 LayerNorm_type,
+                 latent_pre_blocks=1,
+                 latent_shared_blocks=2,
+                 latent_post_blocks=1,
+                 max_loops=4,
+                 train_loop_range=None,
+                 loop_embedding=True,
+                 input_injection=True,
+                 layer_scale_init=0.1):
+        super(RecurrentLatentCore, self).__init__()
+
+        if max_loops < 1:
+            raise ValueError('max_loops must be at least 1.')
+        if latent_shared_blocks < 1:
+            raise ValueError('latent_shared_blocks must be at least 1.')
+
+        if train_loop_range is None:
+            train_loop_range = (max_loops, max_loops)
+        if len(train_loop_range) != 2:
+            raise ValueError('train_loop_range must contain [min_loops, max_loops].')
+        train_min, train_max = (int(train_loop_range[0]), int(train_loop_range[1]))
+        if not 1 <= train_min <= train_max <= max_loops:
+            raise ValueError(
+                'train_loop_range must satisfy 1 <= min <= max <= max_loops.')
+
+        def make_block():
+            return TransformerBlock(
+                dim=dim,
+                num_heads=num_heads,
+                ffn_expansion_factor=ffn_expansion_factor,
+                bias=bias,
+                LayerNorm_type=LayerNorm_type)
+
+        self.latent_pre = nn.Sequential(
+            *[make_block() for _ in range(latent_pre_blocks)])
+        self.shared_core = nn.Sequential(
+            *[make_block() for _ in range(latent_shared_blocks)])
+        self.latent_post = nn.Sequential(
+            *[make_block() for _ in range(latent_post_blocks)])
+
+        self.max_loops = int(max_loops)
+        self.train_loop_range = (train_min, train_max)
+        self.input_inject = (nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+                             if input_injection else None)
+        if input_injection:
+            self.input_scale = nn.Parameter(
+                torch.full((self.max_loops, 1, 1, 1), float(layer_scale_init)))
+        else:
+            self.register_parameter('input_scale', None)
+
+        if loop_embedding:
+            self.loop_embedding = nn.Parameter(
+                torch.zeros(self.max_loops, dim, 1, 1))
+        else:
+            self.register_parameter('loop_embedding', None)
+
+        self.layer_scale = nn.Parameter(
+            torch.full((self.max_loops, 1, 1, 1), float(layer_scale_init)))
+
+    def _resolve_num_loops(self, max_loops):
+        if max_loops is not None:
+            num_loops = int(max_loops)
+        elif self.training:
+            num_loops = random.randint(*self.train_loop_range)
+        else:
+            num_loops = self.max_loops
+
+        if not 1 <= num_loops <= self.max_loops:
+            raise ValueError(
+                f'num_loops must be in [1, {self.max_loops}], got {num_loops}.')
+        return num_loops
+
+    def forward(self, x, max_loops=None, return_states=False):
+        num_loops = self._resolve_num_loops(max_loops)
+        h0 = self.latent_pre(x)
+        h = h0
+        states = []
+        injected = self.input_inject(h0) if self.input_inject is not None else None
+
+        for loop_id in range(num_loops):
+            u = h
+            if injected is not None:
+                u = u + self.input_scale[loop_id] * injected
+            if self.loop_embedding is not None:
+                u = u + self.loop_embedding[loop_id]
+
+            z = self.shared_core(u)
+            delta = z - u
+            h = h + self.layer_scale[loop_id] * delta
+            states.append(h)
+
+        final_state = self.latent_post(h)
+        exit_stats = {'num_loops': num_loops}
+        if return_states:
+            return final_state, states, exit_stats
+        return final_state, [], exit_stats
+
 class DRSformer(nn.Module):
     def __init__(self,
                  inp_channels=3,
@@ -444,8 +556,7 @@ class DRSformer(nn.Module):
 
         self.output = nn.Conv2d(int(dim * 2 ** 1), out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
 
-    def forward(self, inp_img):
-
+    def _encode(self, inp_img):
         inp_enc_level1 = self.patch_embed(inp_img)
         inp_enc_level0 = self.encoder_level0(inp_enc_level1) ## We do not use MEFC for training Rain200L and SPA-Data
         out_enc_level1 = self.encoder_level1(inp_enc_level0)  
@@ -457,8 +568,10 @@ class DRSformer(nn.Module):
         out_enc_level3 = self.encoder_level3(inp_enc_level3)
 
         inp_enc_level4 = self.down3_4(out_enc_level3)
-        latent = self.latent(inp_enc_level4)
+        return inp_enc_level4, (out_enc_level1, out_enc_level2, out_enc_level3)
 
+    def _decode(self, latent, encoder_skips, inp_img):
+        out_enc_level1, out_enc_level2, out_enc_level3 = encoder_skips
         inp_dec_level3 = self.up4_3(latent)
         inp_dec_level3 = torch.cat([inp_dec_level3, out_enc_level3], 1)
         inp_dec_level3 = self.reduce_chan_level3(inp_dec_level3)
@@ -476,8 +589,103 @@ class DRSformer(nn.Module):
         out_dec_level1 = self.refinement(out_dec_level1) ## We do not use MEFC for training Rain200L and SPA-Data
 
         out_dec_level1 = self.output(out_dec_level1) + inp_img
-
         return out_dec_level1
+
+    def forward(self, inp_img):
+        inp_enc_level4, encoder_skips = self._encode(inp_img)
+        latent = self.latent(inp_enc_level4)
+        return self._decode(latent, encoder_skips, inp_img)
+
+
+class LoopDRSformer(DRSformer):
+    """DRSformer with a recurrent, parameter-shared latent stage."""
+
+    def __init__(self,
+                 inp_channels=3,
+                 out_channels=3,
+                 dim=48,
+                 num_blocks=[4, 6, 6, 8],
+                 heads=[1, 2, 4, 8],
+                 ffn_expansion_factor=2.66,
+                 bias=False,
+                 LayerNorm_type='WithBias',
+                 latent_pre_blocks=1,
+                 latent_shared_blocks=2,
+                 latent_post_blocks=1,
+                 max_loops=4,
+                 train_loop_range=None,
+                 loop_embedding=True,
+                 input_injection=True,
+                 layer_scale_init=0.1,
+                 intermediate_supervision=True,
+                 dynamic_tksa=False,
+                 rain_gate=False,
+                 adaptive_exit=False):
+        if dynamic_tksa or rain_gate or adaptive_exit:
+            raise NotImplementedError(
+                'dynamic_tksa, rain_gate, and adaptive_exit belong to later '
+                'stages and must remain disabled for the fixed-loop model.')
+
+        super(LoopDRSformer, self).__init__(
+            inp_channels=inp_channels,
+            out_channels=out_channels,
+            dim=dim,
+            num_blocks=num_blocks,
+            heads=heads,
+            ffn_expansion_factor=ffn_expansion_factor,
+            bias=bias,
+            LayerNorm_type=LayerNorm_type)
+
+        latent_dim = int(dim * 2 ** 3)
+        self.latent = RecurrentLatentCore(
+            dim=latent_dim,
+            num_heads=heads[3],
+            ffn_expansion_factor=ffn_expansion_factor,
+            bias=bias,
+            LayerNorm_type=LayerNorm_type,
+            latent_pre_blocks=latent_pre_blocks,
+            latent_shared_blocks=latent_shared_blocks,
+            latent_post_blocks=latent_post_blocks,
+            max_loops=max_loops,
+            train_loop_range=train_loop_range,
+            loop_embedding=loop_embedding,
+            input_injection=input_injection,
+            layer_scale_init=layer_scale_init)
+        self.intermediate_supervision = bool(intermediate_supervision)
+        self.aux_output = nn.Conv2d(
+            latent_dim, out_channels, kernel_size=3, stride=1, padding=1,
+            bias=bias)
+        self.last_loop_stats = None
+
+    def _aux_prediction(self, latent, inp_img):
+        residual = self.aux_output(latent)
+        residual = F.interpolate(
+            residual, size=inp_img.shape[-2:], mode='bilinear',
+            align_corners=False)
+        return residual + inp_img
+
+    def forward(self, inp_img, force_loops=None, return_aux=None):
+        if return_aux is None:
+            return_aux = self.training and self.intermediate_supervision
+
+        inp_enc_level4, encoder_skips = self._encode(inp_img)
+        latent, loop_states, exit_stats = self.latent(
+            inp_enc_level4,
+            max_loops=force_loops,
+            return_states=return_aux)
+        self.last_loop_stats = exit_stats
+        output = self._decode(latent, encoder_skips, inp_img)
+
+        if not return_aux:
+            return output
+
+        # The last loop state is supervised by the full decoder output. Earlier
+        # states use one shared lightweight head, as proposed in the design.
+        predictions = [
+            self._aux_prediction(state, inp_img) for state in loop_states[:-1]
+        ]
+        predictions.append(output)
+        return predictions
 
 if __name__ == '__main__':
     input = torch.rand(1, 3, 256, 256)
