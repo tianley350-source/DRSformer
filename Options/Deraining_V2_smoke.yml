@@ -1,0 +1,116 @@
+# Two-iteration configuration for verifying the complete V2 training path.
+name: debug_Deraining_LoopDRSformerV2_smoke
+model_type: ImageCleanModel
+scale: 1
+num_gpu: 1
+manual_seed: 100
+
+datasets:
+  train:
+    name: TrainSet
+    type: Dataset_PairedImage
+    dataroot_gt: ./Datasets/train/Rain200H/target
+    dataroot_lq: ./Datasets/train/Rain200H/input
+    geometric_augs: true
+    filename_tmpl: '{}'
+    io_backend:
+      type: disk
+    use_shuffle: true
+    num_worker_per_gpu: 0
+    batch_size_per_gpu: 1
+    mini_batch_sizes: [1]
+    iters: [2]
+    gt_size: 32
+    gt_sizes: [32]
+    dataset_enlarge_ratio: 1
+    prefetch_mode: ~
+
+  val:
+    name: ValSet
+    type: Dataset_PairedImage
+    dataroot_gt: ./Datasets/test/Rain200H/target
+    dataroot_lq: ./Datasets/test/Rain200H/input
+    io_backend:
+      type: disk
+
+network_g:
+  type: LoopDRSformerV2
+  inp_channels: 3
+  out_channels: 3
+  dim: 48
+  num_blocks: [4, 6, 6, 8]
+  heads: [1, 2, 4, 8]
+  ffn_expansion_factor: 2.66
+  bias: false
+  LayerNorm_type: WithBias
+  latent_pre_blocks: 1
+  latent_shared_blocks: 4
+  latent_post_blocks: 1
+  max_loops: 2
+  train_loop_range: [2, 2]
+  loop_embedding: true
+  loop_adapters: true
+  input_injection: true
+  layer_scale_init: 0.1
+  intermediate_supervision: false
+  dynamic_tksa: true
+  rain_gate: true
+  adaptive_exit: false
+
+path:
+  pretrain_network_g: ~
+  strict_load_g: false
+  resume_state: ~
+
+train:
+  total_iter: 2
+  warmup_iter: -1
+  use_grad_clip: true
+  grad_clip_norm: 1.0
+  scheduler:
+    type: CosineAnnealingRestartCyclicLR
+    periods: [2]
+    restart_weights: [1]
+    eta_mins: [0.000001]
+  mixing_augs:
+    mixup: false
+    mixup_beta: 1.2
+    use_identity: true
+  optim_g:
+    type: AdamW
+    lr: !!float 3e-4
+    weight_decay: !!float 1e-4
+    betas: [0.9, 0.999]
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1
+    reduction: mean
+
+val:
+  window_size: 8
+  val_freq: 8
+  save_img: false
+  rgb2bgr: true
+  use_image: true
+  max_minibatch: 1
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: true
+    ssim:
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: true
+
+logger:
+  print_freq: 1
+  save_checkpoint_freq: 8
+  use_tb_logger: false
+  wandb:
+    project: ~
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29500

@@ -116,7 +116,7 @@ class Attention(nn.Module):
         self.attn3 = torch.nn.Parameter(torch.tensor([0.2]), requires_grad=True)
         self.attn4 = torch.nn.Parameter(torch.tensor([0.2]), requires_grad=True)
 
-    def forward(self, x):
+    def forward(self, x, mix_weights=None):
         b, c, h, w = x.shape
 
         qkv = self.qkv_dwconv(self.qkv(x))
@@ -164,7 +164,16 @@ class Attention(nn.Module):
         out3 = (attn3 @ v)
         out4 = (attn4 @ v)
 
-        out = out1 * self.attn1 + out2 * self.attn2 + out3 * self.attn3 + out4 * self.attn4
+        if mix_weights is None:
+            out = (out1 * self.attn1 + out2 * self.attn2 +
+                   out3 * self.attn3 + out4 * self.attn4)
+        else:
+            if mix_weights.shape != (b, self.num_heads, 4):
+                raise ValueError(
+                    'mix_weights must have shape '
+                    f'[{b}, {self.num_heads}, 4], got {list(mix_weights.shape)}.')
+            branches = torch.stack((out1, out2, out3, out4), dim=-1)
+            out = (branches * mix_weights[:, :, None, None, :]).sum(dim=-1)
 
         out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
 
@@ -181,8 +190,8 @@ class TransformerBlock(nn.Module):
         self.norm2 = LayerNorm(dim, LayerNorm_type)
         self.ffn = FeedForward(dim, ffn_expansion_factor, bias)
 
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
+    def forward(self, x, attention_weights=None):
+        x = x + self.attn(self.norm1(x), mix_weights=attention_weights)
         x = x + self.ffn(self.norm2(x))
 
         return x
@@ -497,6 +506,215 @@ class RecurrentLatentCore(nn.Module):
             return final_state, states, exit_stats
         return final_state, [], exit_stats
 
+
+class DynamicTKSARouter(nn.Module):
+    """Predict per-sample, per-head mixtures over the four TKSA branches."""
+
+    def __init__(self, dim, num_heads, max_loops, hidden_ratio=0.25):
+        super(DynamicTKSARouter, self).__init__()
+        hidden_dim = max(16, int(dim * hidden_ratio))
+        self.num_heads = num_heads
+        self.loop_embedding = nn.Embedding(max_loops, dim)
+        self.proj = nn.Sequential(
+            nn.Linear(dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_heads * 4))
+        nn.init.zeros_(self.proj[-1].weight)
+        nn.init.zeros_(self.proj[-1].bias)
+
+    def forward(self, x, loop_id):
+        pooled = F.adaptive_avg_pool2d(x, 1).flatten(1)
+        loop_ids = torch.full(
+            (x.shape[0],), int(loop_id), dtype=torch.long, device=x.device)
+        context = torch.cat((pooled, self.loop_embedding(loop_ids)), dim=1)
+        logits = self.proj(context).view(x.shape[0], self.num_heads, 4)
+        return F.softmax(logits, dim=-1)
+
+
+class RainGate(nn.Module):
+    """Predict a loop-conditioned, single-channel soft update mask."""
+
+    def __init__(self, dim, max_loops):
+        super(RainGate, self).__init__()
+        hidden_dim = max(16, dim // 8)
+        self.reduce = nn.Conv2d(dim * 2, hidden_dim, kernel_size=1)
+        self.loop_embedding = nn.Embedding(max_loops, hidden_dim)
+        self.spatial = nn.Conv2d(
+            hidden_dim, hidden_dim, kernel_size=3, padding=1,
+            groups=hidden_dim)
+        self.output = nn.Conv2d(hidden_dim, 1, kernel_size=1)
+        nn.init.zeros_(self.output.weight)
+        nn.init.constant_(self.output.bias, 2.0)
+
+    def forward(self, h, h0, loop_id):
+        features = F.gelu(self.reduce(torch.cat((h, h0), dim=1)))
+        loop_ids = torch.full(
+            (h.shape[0],), int(loop_id), dtype=torch.long, device=h.device)
+        condition = self.loop_embedding(loop_ids)[:, :, None, None]
+        features = F.gelu(self.spatial(features + condition))
+        return torch.sigmoid(self.output(features))
+
+
+class LoopAdapter(nn.Module):
+    """Low-rank residual adapter specialized for one recurrent round."""
+
+    def __init__(self, dim, reduction=16):
+        super(LoopAdapter, self).__init__()
+        hidden_dim = max(8, dim // reduction)
+        self.body = nn.Sequential(
+            nn.Conv2d(dim, hidden_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, dim, kernel_size=1))
+        nn.init.zeros_(self.body[-1].weight)
+        nn.init.zeros_(self.body[-1].bias)
+
+    def forward(self, x):
+        return self.body(x)
+
+
+class LoopConditionedTransformerBlock(nn.Module):
+    """Transformer block whose TKSA mixture depends on input and loop id."""
+
+    def __init__(self,
+                 dim,
+                 num_heads,
+                 ffn_expansion_factor,
+                 bias,
+                 LayerNorm_type,
+                 max_loops,
+                 dynamic_tksa=True,
+                 loop_adapters=True):
+        super(LoopConditionedTransformerBlock, self).__init__()
+        self.block = TransformerBlock(
+            dim=dim,
+            num_heads=num_heads,
+            ffn_expansion_factor=ffn_expansion_factor,
+            bias=bias,
+            LayerNorm_type=LayerNorm_type)
+        self.router = (DynamicTKSARouter(dim, num_heads, max_loops)
+                       if dynamic_tksa else None)
+        self.adapters = (nn.ModuleList([
+            LoopAdapter(dim) for _ in range(max_loops)
+        ]) if loop_adapters else None)
+
+    def forward(self, x, loop_id):
+        router_weights = (self.router(x, loop_id)
+                          if self.router is not None else None)
+        x = self.block(x, attention_weights=router_weights)
+        if self.adapters is not None:
+            adapter_update = self.adapters[loop_id](x)
+            x = x + adapter_update
+            adapter_norm = adapter_update.square().mean().sqrt()
+        else:
+            adapter_norm = x.new_zeros(())
+        return x, router_weights, adapter_norm
+
+
+class RecurrentLatentCoreV2(RecurrentLatentCore):
+    """Recurrent latent core with loop-conditioned dynamic sparse attention."""
+
+    def __init__(self,
+                 dim,
+                 num_heads,
+                 ffn_expansion_factor,
+                 bias,
+                 LayerNorm_type,
+                 latent_pre_blocks=1,
+                 latent_shared_blocks=4,
+                 latent_post_blocks=1,
+                 max_loops=3,
+                 train_loop_range=None,
+                 loop_embedding=True,
+                 input_injection=True,
+                 layer_scale_init=0.1,
+                 dynamic_tksa=True,
+                 rain_gate=True,
+                 loop_adapters=True):
+        super(RecurrentLatentCoreV2, self).__init__(
+            dim=dim,
+            num_heads=num_heads,
+            ffn_expansion_factor=ffn_expansion_factor,
+            bias=bias,
+            LayerNorm_type=LayerNorm_type,
+            latent_pre_blocks=latent_pre_blocks,
+            latent_shared_blocks=latent_shared_blocks,
+            latent_post_blocks=latent_post_blocks,
+            max_loops=max_loops,
+            train_loop_range=train_loop_range,
+            loop_embedding=loop_embedding,
+            input_injection=input_injection,
+            layer_scale_init=layer_scale_init)
+        self.num_heads = num_heads
+        self.shared_core = nn.ModuleList([
+            LoopConditionedTransformerBlock(
+                dim=dim,
+                num_heads=num_heads,
+                ffn_expansion_factor=ffn_expansion_factor,
+                bias=bias,
+                LayerNorm_type=LayerNorm_type,
+                max_loops=max_loops,
+                dynamic_tksa=dynamic_tksa,
+                loop_adapters=loop_adapters)
+            for _ in range(latent_shared_blocks)
+        ])
+        self.rain_gate = RainGate(dim, max_loops) if rain_gate else None
+
+    def forward(self, x, max_loops=None, return_states=False):
+        num_loops = self._resolve_num_loops(max_loops)
+        h0 = self.latent_pre(x)
+        h = h0
+        states = []
+        all_router_weights = []
+        rain_gate_means = []
+        all_adapter_norms = []
+        injected = self.input_inject(h0) if self.input_inject is not None else None
+
+        for loop_id in range(num_loops):
+            u = h
+            if injected is not None:
+                u = u + self.input_scale[loop_id] * injected
+            if self.loop_embedding is not None:
+                u = u + self.loop_embedding[loop_id]
+
+            z = u
+            loop_router_weights = []
+            loop_adapter_norms = []
+            for block in self.shared_core:
+                z, router_weights, adapter_norm = block(z, loop_id)
+                if router_weights is not None:
+                    loop_router_weights.append(router_weights.mean(dim=0))
+                loop_adapter_norms.append(adapter_norm)
+            if loop_router_weights:
+                all_router_weights.append(torch.stack(loop_router_weights))
+            all_adapter_norms.append(torch.stack(loop_adapter_norms))
+
+            delta = z - u
+            gate = (self.rain_gate(h, h0, loop_id)
+                    if self.rain_gate is not None else 1.0)
+            h = h + self.layer_scale[loop_id] * gate * delta
+            if self.rain_gate is not None:
+                rain_gate_means.append(gate.mean())
+            states.append(h)
+
+        final_state = self.latent_post(h)
+        if all_router_weights:
+            router_stats = torch.stack(all_router_weights).detach()
+        else:
+            router_stats = torch.empty(
+                num_loops, len(self.shared_core), self.num_heads, 0,
+                device=x.device)
+        exit_stats = {
+            'num_loops': num_loops,
+            'router_weights': router_stats,
+            'rain_gate_means': (torch.stack(rain_gate_means).detach()
+                                if rain_gate_means else
+                                torch.empty(0, device=x.device)),
+            'adapter_update_norms': torch.stack(all_adapter_norms).detach(),
+        }
+        if return_states:
+            return final_state, states, exit_stats
+        return final_state, [], exit_stats
+
 class DRSformer(nn.Module):
     def __init__(self,
                  inp_channels=3,
@@ -686,6 +904,112 @@ class LoopDRSformer(DRSformer):
         ]
         predictions.append(output)
         return predictions
+
+
+class LoopDRSformerV2(LoopDRSformer):
+    """Capacity-balanced recurrent model with quality-oriented conditioning."""
+
+    def __init__(self,
+                 inp_channels=3,
+                 out_channels=3,
+                 dim=48,
+                 num_blocks=[4, 6, 6, 8],
+                 heads=[1, 2, 4, 8],
+                 ffn_expansion_factor=2.66,
+                 bias=False,
+                 LayerNorm_type='WithBias',
+                 latent_pre_blocks=1,
+                 latent_shared_blocks=4,
+                 latent_post_blocks=1,
+                 max_loops=3,
+                 train_loop_range=None,
+                 loop_embedding=True,
+                 input_injection=True,
+                 layer_scale_init=0.1,
+                 intermediate_supervision=True,
+                 loop_adapters=True,
+                 dynamic_tksa=True,
+                 rain_gate=True,
+                 adaptive_exit=False):
+        if adaptive_exit:
+            raise NotImplementedError(
+                'adaptive_exit is not part of the quality-first V2 model.')
+        super(LoopDRSformerV2, self).__init__(
+            inp_channels=inp_channels,
+            out_channels=out_channels,
+            dim=dim,
+            num_blocks=num_blocks,
+            heads=heads,
+            ffn_expansion_factor=ffn_expansion_factor,
+            bias=bias,
+            LayerNorm_type=LayerNorm_type,
+            latent_pre_blocks=latent_pre_blocks,
+            latent_shared_blocks=latent_shared_blocks,
+            latent_post_blocks=latent_post_blocks,
+            max_loops=max_loops,
+            train_loop_range=train_loop_range,
+            loop_embedding=loop_embedding,
+            input_injection=input_injection,
+            layer_scale_init=layer_scale_init,
+            intermediate_supervision=intermediate_supervision,
+            dynamic_tksa=False,
+            rain_gate=False,
+            adaptive_exit=False)
+        latent_dim = int(dim * 2 ** 3)
+        self.latent = RecurrentLatentCoreV2(
+            dim=latent_dim,
+            num_heads=heads[3],
+            ffn_expansion_factor=ffn_expansion_factor,
+            bias=bias,
+            LayerNorm_type=LayerNorm_type,
+            latent_pre_blocks=latent_pre_blocks,
+            latent_shared_blocks=latent_shared_blocks,
+            latent_post_blocks=latent_post_blocks,
+            max_loops=max_loops,
+            train_loop_range=train_loop_range,
+            loop_embedding=loop_embedding,
+            input_injection=input_injection,
+            layer_scale_init=layer_scale_init,
+            dynamic_tksa=dynamic_tksa,
+            rain_gate=rain_gate,
+            loop_adapters=loop_adapters)
+        self.use_loop_adapters = bool(loop_adapters)
+        self.use_dynamic_tksa = bool(dynamic_tksa)
+        self.use_rain_gate = bool(rain_gate)
+
+    def forward(self,
+                inp_img,
+                force_loops=None,
+                return_aux=None,
+                return_details=False):
+        if return_aux is None:
+            return_aux = self.training and self.intermediate_supervision
+
+        inp_enc_level4, encoder_skips = self._encode(inp_img)
+        latent, loop_states, loop_stats = self.latent(
+            inp_enc_level4,
+            max_loops=force_loops,
+            return_states=return_aux)
+        self.last_loop_stats = loop_stats
+        output = self._decode(latent, encoder_skips, inp_img)
+
+        predictions = [output]
+        if return_aux:
+            predictions = [
+                self._aux_prediction(state, inp_img)
+                for state in loop_states[:-1]
+            ]
+            predictions.append(output)
+
+        if return_details:
+            return {
+                'output': output,
+                'predictions': predictions,
+                'loop_stats': loop_stats,
+            }
+        if return_aux:
+            return predictions
+        return output
 
 if __name__ == '__main__':
     input = torch.rand(1, 3, 256, 256)

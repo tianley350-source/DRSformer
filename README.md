@@ -50,6 +50,19 @@ bash train.sh
 ```
 Run the script then you can find the generated experimental logs in the folder `experiments`.
 
+### LoopDRSformerV2 experimental configuration
+
+`Options/Deraining_V2.yml` provides a lower-parameter recurrent variant with
+loop-conditioned TKSA routing, rain-aware update gates and lightweight
+per-round adapters. Train it with:
+
+```powershell
+python basicsr/train.py -opt Options/Deraining_V2.yml --launcher none
+```
+
+See [`benchmarks/README.md`](benchmarks/README.md) for the deterministic
+short-training comparison against the original DRSformer and its limitations.
+
 ## Testing
 1. Please download the corresponding testing datasets and put them in the folder `test/input`. Download the corresponding pre-trained models and put them in the folder `pretrained_models`.
 2. Note that we do not use MEFC for training Rain200L and SPA-Data, because their rain streaks are less complex and easier to learn. Please modify the file `DRSformer_arch.py`. See the file `DRSformer_arch_200L+SPA.py`.

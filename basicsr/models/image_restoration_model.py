@@ -176,8 +176,13 @@ class ImageCleanModel(BaseModel):
         loss_dict['l_pix'] = l_pix
 
         l_pix.backward()
-        if self.opt['train']['use_grad_clip']:
-            torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), 0.01)
+        if self.opt['train'].get('use_grad_clip', False):
+            grad_clip_norm = float(
+                self.opt['train'].get('grad_clip_norm', 0.01))
+            if grad_clip_norm <= 0:
+                raise ValueError('grad_clip_norm must be greater than zero.')
+            torch.nn.utils.clip_grad_norm_(
+                self.net_g.parameters(), grad_clip_norm)
         self.optimizer_g.step()
 
         self.log_dict = self.reduce_loss_dict(loss_dict)

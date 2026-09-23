@@ -1,0 +1,42 @@
+{
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 4060 8 GB",
+    "pytorch": "2.5.1+cu124"
+  },
+  "protocol": {
+    "steps": 100,
+    "patch_size": 32,
+    "train_pairs": 3,
+    "test_pairs": 3,
+    "model_seed": 100,
+    "crop_schedule_seed": 20260922,
+    "optimizer": "AdamW",
+    "learning_rate": 0.0003,
+    "grad_clip_norm": 1.0,
+    "deterministic_cuda": true
+  },
+  "RainyInput": {
+    "psnr_y": 15.46243667602539,
+    "ssim_y": 0.4088929510473311
+  },
+  "DRSformer": {
+    "params": 33655424,
+    "train_seconds": 65.96565250000276,
+    "peak_cuda_mib": 2536.6572265625,
+    "psnr_y": 19.32728449503581,
+    "ssim_y": 0.5178554586749895
+  },
+  "LoopDRSformerV2": {
+    "params": 29695357,
+    "train_seconds": 71.82993809999607,
+    "peak_cuda_mib": 2506.82373046875,
+    "psnr_y": 19.49847412109375,
+    "ssim_y": 0.5591091002924528
+  },
+  "V2_minus_DRSformer": {
+    "params": -3960067,
+    "params_percent": -11.76651447047684,
+    "psnr_y_db": 0.17118962605794108,
+    "ssim_y": 0.04125364161746331
+  }
+}
