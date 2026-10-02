@@ -1,4 +1,4 @@
-"""Deterministic short-training comparison for DRSformer and V2.
+"""Deterministic short-training comparison for DRSformer, V2, and V3.
 
 This benchmark is a development check, not a replacement for full-dataset
 training. It gives both models the same crops, optimizer, update count and
@@ -6,6 +6,7 @@ repository PSNR-Y/SSIM-Y implementations.
 """
 
 import argparse
+import copy
 import json
 import os
 import random
@@ -23,13 +24,16 @@ import torch
 import torch.nn.functional as F
 
 from basicsr.metrics.psnr_ssim import calculate_psnr, calculate_ssim
-from basicsr.models.archs.DRSformer_arch import DRSformer, LoopDRSformerV2
+from basicsr.models.archs.DRSformer_arch import (
+    DRSformer, LoopDRSformerV2, LoopDRSformerV3)
 from basicsr.utils.img_util import tensor2img
 
 
 MODEL_SEED = 100
 CROP_SCHEDULE_SEED = 20260922
 GRAD_CLIP_NORM = 1.0
+V3_AUXILIARY_WEIGHT = 0.1
+V3_EMA_DECAY = 0.999
 
 
 def parse_args():
@@ -39,6 +43,12 @@ def parse_args():
         help='DRSformer repository root.')
     parser.add_argument('--steps', type=int, default=100)
     parser.add_argument('--patch-size', type=int, default=32)
+    parser.add_argument(
+        '--v3-aux-weight', type=float, default=V3_AUXILIARY_WEIGHT)
+    parser.add_argument(
+        '--models', nargs='+',
+        choices=('DRSformer', 'LoopDRSformerV2', 'LoopDRSformerV3'),
+        default=('DRSformer', 'LoopDRSformerV2', 'LoopDRSformerV3'))
     parser.add_argument('--output', type=Path, help='Optional JSON output path.')
     return parser.parse_args()
 
@@ -107,30 +117,39 @@ def create_model(model_name):
         LayerNorm_type='WithBias')
     if model_name == 'DRSformer':
         return DRSformer(**common)
-    if model_name != 'LoopDRSformerV2':
+    if model_name not in ('LoopDRSformerV2', 'LoopDRSformerV3'):
         raise ValueError(f'Unknown model: {model_name}')
-    return LoopDRSformerV2(
+    model_class = (LoopDRSformerV3
+                   if model_name == 'LoopDRSformerV3'
+                   else LoopDRSformerV2)
+    return model_class(
         **common,
         latent_pre_blocks=1,
         latent_shared_blocks=4,
-        latent_post_blocks=1,
+        latent_post_blocks=(2 if model_name == 'LoopDRSformerV3' else 1),
         max_loops=2,
         train_loop_range=[2, 2],
         loop_embedding=True,
         loop_adapters=True,
         input_injection=True,
         layer_scale_init=0.1,
-        intermediate_supervision=False,
+        intermediate_supervision=(model_name == 'LoopDRSformerV3'),
         dynamic_tksa=True,
         rain_gate=True,
         adaptive_exit=False)
 
 
-def train_model(model_name, train_pairs, schedule, patch_size, device):
+def train_model(model_name, train_pairs, schedule, patch_size, device,
+                v3_auxiliary_weight):
     torch.manual_seed(MODEL_SEED)
     torch.cuda.manual_seed_all(MODEL_SEED)
     random.seed(MODEL_SEED)
     model = create_model(model_name).to(device).train()
+    ema_model = None
+    if model_name == 'LoopDRSformerV3':
+        ema_model = copy.deepcopy(model).eval()
+        for parameter in ema_model.parameters():
+            parameter.requires_grad_(False)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=3e-4, weight_decay=1e-4,
         betas=(0.9, 0.999))
@@ -144,19 +163,31 @@ def train_model(model_name, train_pairs, schedule, patch_size, device):
         gt = augment(gt[region], aug).unsqueeze(0).to(device)
 
         optimizer.zero_grad(set_to_none=True)
-        prediction = model(lq)
-        if isinstance(prediction, list):
-            prediction = prediction[-1]
-        loss = F.l1_loss(prediction, gt)
+        predictions = model(lq)
+        if isinstance(predictions, list):
+            loss = (v3_auxiliary_weight * F.l1_loss(predictions[0], gt) +
+                    F.l1_loss(predictions[-1], gt))
+        else:
+            loss = F.l1_loss(predictions, gt)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
         optimizer.step()
+        if ema_model is not None:
+            with torch.no_grad():
+                model_state = model.state_dict()
+                for name, ema_value in ema_model.state_dict().items():
+                    source = model_state[name]
+                    if torch.is_floating_point(ema_value):
+                        ema_value.mul_(V3_EMA_DECAY).add_(
+                            source, alpha=1 - V3_EMA_DECAY)
+                    else:
+                        ema_value.copy_(source)
         losses.append(float(loss.detach()))
         if step == 1 or step % 10 == 0:
             print(
                 f'{model_name}: step={step}, loss={losses[-1]:.6f}',
                 flush=True)
-    return model, losses, time.perf_counter() - started
+    return model, ema_model, losses, time.perf_counter() - started
 
 
 def pad_to_multiple(tensor, multiple=8):
@@ -230,6 +261,8 @@ def main():
             'optimizer': 'AdamW',
             'learning_rate': 3e-4,
             'grad_clip_norm': GRAD_CLIP_NORM,
+            'v3_auxiliary_weight': args.v3_aux_weight,
+            'v3_ema_decay': V3_EMA_DECAY,
             'deterministic_cuda': True,
         }
     }
@@ -238,11 +271,12 @@ def main():
         'per_image': input_rows,
         'mean': summarize(input_rows)}
 
-    for model_name in ('DRSformer', 'LoopDRSformerV2'):
+    for model_name in args.models:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        model, losses, elapsed = train_model(
-            model_name, train_pairs, schedule, args.patch_size, device)
+        model, ema_model, losses, elapsed = train_model(
+            model_name, train_pairs, schedule, args.patch_size, device,
+            args.v3_aux_weight)
         rows = evaluate_model(model, test_pairs, device)
         results[model_name] = {
             'params': sum(parameter.numel()
@@ -254,6 +288,11 @@ def main():
             'per_image': rows,
             'mean': summarize(rows),
         }
+        if ema_model is not None:
+            ema_rows = evaluate_model(ema_model, test_pairs, device)
+            results[model_name]['ema_per_image'] = ema_rows
+            results[model_name]['ema_mean'] = summarize(ema_rows)
+            del ema_model
         del model
         torch.cuda.empty_cache()
 

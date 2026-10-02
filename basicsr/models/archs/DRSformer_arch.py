@@ -1011,6 +1011,25 @@ class LoopDRSformerV2(LoopDRSformer):
             return predictions
         return output
 
+
+class LoopDRSformerV3(LoopDRSformerV2):
+    """Higher-capacity recurrent variant for quality-first training.
+
+    V3 keeps the two-round shared recurrent core from V2, adds a second
+    unshared post-latent block, and enables supervision of the first loop by
+    default.  EMA remains a training-model concern and is configured in the
+    corresponding option file.
+    """
+
+    def __init__(self,
+                 latent_post_blocks=2,
+                 intermediate_supervision=True,
+                 **kwargs):
+        super(LoopDRSformerV3, self).__init__(
+            latent_post_blocks=latent_post_blocks,
+            intermediate_supervision=intermediate_supervision,
+            **kwargs)
+
 if __name__ == '__main__':
     input = torch.rand(1, 3, 256, 256)
     model = DRSformer()

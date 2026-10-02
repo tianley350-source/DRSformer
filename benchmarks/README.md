@@ -1,9 +1,12 @@
-# LoopDRSformerV2 short-training benchmark
+# LoopDRSformer short-training benchmark
 
 This benchmark is a deterministic development comparison between the original
-DRSformer and `LoopDRSformerV2`. Both models receive the same 100 augmented
-32x32 crops, AdamW settings, gradient clipping and repository PSNR-Y/SSIM-Y
-metric implementations.
+DRSformer, `LoopDRSformerV2`, and `LoopDRSformerV3`. All models receive the
+same 100 augmented 32x32 crops, AdamW settings, gradient clipping and
+repository PSNR-Y/SSIM-Y metric implementations. V3 additionally uses its
+configured 0.1-weight intermediate loss; the table reports its current model
+weights because a 0.999 EMA is intentionally too slow to be representative
+after only 100 updates.
 
 Run from the repository root:
 
@@ -12,14 +15,15 @@ $env:PYTHONPATH=(Resolve-Path '.').Path
 python benchmarks/compare_drsformer_v2.py --steps 100 --patch-size 32
 ```
 
-The checked-in run used the three available Rain200H training pairs and three
-test pairs, an RTX 4060 8 GB, PyTorch 2.5.1+cu124 and seed 100.
+The checked-in V3 run used the three available Rain200H training pairs and
+three test pairs, an RTX 4060 Laptop GPU, PyTorch 2.4.1+cu121 and seed 100.
 
 | Model | Parameters | PSNR-Y | SSIM-Y |
 |---|---:|---:|---:|
 | DRSformer | 33,655,424 | 19.3273 | 0.5179 |
-| LoopDRSformerV2 | 29,695,357 | **19.4985** | **0.5591** |
-| V2 change | **-11.77%** | **+0.1712 dB** | **+0.0413** |
+| LoopDRSformerV2 | 29,695,357 | 19.4985 | **0.5591** |
+| LoopDRSformerV3 | 32,004,209 | **19.5774** | 0.5462 |
+| V3 change vs. DRSformer | **-4.91%** | **+0.2501 dB** | **+0.0284** |
 
 These values establish that the implementation runs and that this ablation is
 promising. They are not publication-level quality claims: 100 optimizer steps

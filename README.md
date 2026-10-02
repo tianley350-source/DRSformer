@@ -63,6 +63,25 @@ python basicsr/train.py -opt Options/Deraining_V2.yml --launcher none
 See [`benchmarks/README.md`](benchmarks/README.md) for the deterministic
 short-training comparison against the original DRSformer and its limitations.
 
+### LoopDRSformerV3 quality-oriented configuration
+
+`Options/Deraining_V3.yml` adds a second unshared post-latent block, supervises
+the first recurrent result with weight 0.1, and validates with a 0.999 EMA
+copy. It has 32,004,209 parameters, which is 4.91% below the original
+DRSformer. Checkpoints are saved every 10,000 steps to avoid the disk growth of
+the earlier 1,000-step policy.
+
+Run it from the repository root with:
+
+```powershell
+$env:PYTHONPATH=(Get-Location).Path
+python -m basicsr.train -opt .\Options\Deraining_V3.yml --launcher none
+```
+
+The included 100-step result is only a development check. Full 300,000-step
+Rain200H training is still required before claiming that V3 exceeds the
+original model.
+
 ## Testing
 1. Please download the corresponding testing datasets and put them in the folder `test/input`. Download the corresponding pre-trained models and put them in the folder `pretrained_models`.
 2. Note that we do not use MEFC for training Rain200L and SPA-Data, because their rain streaks are less complex and easier to learn. Please modify the file `DRSformer_arch.py`. See the file `DRSformer_arch_200L+SPA.py`.
