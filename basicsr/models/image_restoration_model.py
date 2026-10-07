@@ -92,9 +92,11 @@ class ImageCleanModel(BaseModel):
             # load pretrained model
             load_path = self.opt['path'].get('pretrain_network_g', None)
             if load_path is not None:
+                ema_param_key = self.opt['path'].get(
+                    'ema_param_key', 'params_ema')
                 self.load_network(self.net_g_ema, load_path,
                                   self.opt['path'].get('strict_load_g',
-                                                       True), 'params_ema')
+                                                       True), ema_param_key)
             else:
                 self.model_ema(0)  # copy net_g weight
             self.net_g_ema.eval()

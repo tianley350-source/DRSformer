@@ -105,6 +105,10 @@ than another 300,000-step run:
 python -m basicsr.train -opt .\Options\Deraining_V4_finetune.yml --launcher none
 ```
 
+If the raw checkpoint wins the comparison, change both `param_key` and
+`ema_param_key` in the fine-tuning option to `params`. Keeping the two keys
+equal guarantees that the trainable and EMA copies start from the same winner.
+
 For a new from-scratch run, `Options/Deraining_V4.yml` uses the same proven V3
 backbone while retiring the auxiliary loss over the first 100,000 updates and
 progressing from 128 to 160 to 192-pixel crops. Neither recipe is a SOTA claim;

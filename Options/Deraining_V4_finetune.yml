@@ -62,6 +62,7 @@ path:
   # Change this only if your V3 experiment directory has a different name.
   pretrain_network_g: ./experiments/Deraining_LoopDRSformerV3/models/net_g_latest.pth
   param_key: params_ema
+  ema_param_key: params_ema
   strict_load_g: true
   resume_state: ~
 

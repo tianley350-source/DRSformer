@@ -1,6 +1,7 @@
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import torch
 import yaml
@@ -101,10 +102,41 @@ class QualityCurriculumTests(unittest.TestCase):
         train_data = options['datasets']['train']
 
         self.assertEqual(options['path']['param_key'], 'params_ema')
+        self.assertEqual(options['path']['ema_param_key'], 'params_ema')
         self.assertTrue(options['path']['strict_load_g'])
         self.assertFalse(options['network_g']['intermediate_supervision'])
         self.assertEqual(train_data['gt_sizes'], [160, 192])
         self.assertEqual(sum(train_data['iters']), options['train']['total_iter'])
+
+    def test_finetune_can_initialize_both_models_from_raw_weights(self):
+        options = self._small_training_options()
+        options['train']['ema_decay'] = 0.9
+        source_model = define_network(self._small_network_options())
+        raw_state = source_model.state_dict()
+        ema_state = {
+            name: (value + 1 if torch.is_floating_point(value) else value)
+            for name, value in raw_state.items()
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / 'weights.pth'
+            torch.save({'params': raw_state, 'params_ema': ema_state},
+                       checkpoint_path)
+            options['path'].update({
+                'pretrain_network_g': str(checkpoint_path),
+                'param_key': 'params',
+                'ema_param_key': 'params',
+                'strict_load_g': True,
+            })
+
+            loaded_model = ImageCleanModel(deepcopy(options))
+            training_state = loaded_model.get_bare_model(
+                loaded_model.net_g).state_dict()
+            ema_loaded_state = loaded_model.net_g_ema.state_dict()
+
+        self.assertTrue(all(
+            torch.equal(training_state[name], ema_loaded_state[name])
+            for name in training_state))
 
 
 if __name__ == '__main__':
