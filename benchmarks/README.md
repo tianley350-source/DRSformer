@@ -30,3 +30,16 @@ promising. They are not publication-level quality claims: 100 optimizer steps
 and six paired images are far too small to estimate final Rain200H
 generalization. A proper conclusion requires full training and evaluation on
 the complete benchmark split.
+
+The completed V3 run later reached 32.0573 PSNR-Y / 0.9298 SSIM-Y, versus the
+matched original model's best 32.0762 / 0.9298. This confirms why the short
+screen must not be presented as a final result.
+
+To compare raw and EMA weights from one full checkpoint under the same metric
+implementation, run:
+
+```powershell
+python .\benchmarks\evaluate_checkpoint_variants.py `
+  --checkpoint .\experiments\Deraining_LoopDRSformerV3\models\net_g_latest.pth `
+  --options .\Options\Deraining_V3.yml
+```

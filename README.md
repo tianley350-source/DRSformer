@@ -78,9 +78,37 @@ $env:PYTHONPATH=(Get-Location).Path
 python -m basicsr.train -opt .\Options\Deraining_V3.yml --launcher none
 ```
 
-The included 100-step result is only a development check. Full 300,000-step
-Rain200H training is still required before claiming that V3 exceeds the
-original model.
+The completed 300,000-step Rain200H run reached 32.0573 PSNR-Y / 0.9298
+SSIM-Y with EMA. The matched original run reached 32.0726 / 0.9298 at the
+final step and 32.0762 / 0.9298 at its best validation, so V3 is lighter and
+very close, but it does not exceed the original under this protocol.
+
+### V3 quality-recovery curriculum
+
+Before training again, evaluate both weight variants in the completed V3
+checkpoint. Training-time validation uses EMA whenever it exists, so the raw
+weights otherwise remain unmeasured:
+
+```powershell
+$env:PYTHONPATH=(Get-Location).Path
+python .\benchmarks\evaluate_checkpoint_variants.py `
+  --checkpoint .\experiments\Deraining_LoopDRSformerV3\models\net_g_latest.pth `
+  --options .\Options\Deraining_V3.yml
+```
+
+`Options/Deraining_V4_finetune.yml` is the recommended next experiment. It
+starts from V3 EMA, disables the auxiliary head and fine-tunes for 50,000
+updates on 160/192-pixel crops with a small learning rate. This is much cheaper
+than another 300,000-step run:
+
+```powershell
+python -m basicsr.train -opt .\Options\Deraining_V4_finetune.yml --launcher none
+```
+
+For a new from-scratch run, `Options/Deraining_V4.yml` uses the same proven V3
+backbone while retiring the auxiliary loss over the first 100,000 updates and
+progressing from 128 to 160 to 192-pixel crops. Neither recipe is a SOTA claim;
+the full Rain200H test result must establish that.
 
 ## Testing
 1. Please download the corresponding testing datasets and put them in the folder `test/input`. Download the corresponding pre-trained models and put them in the folder `pretrained_models`.

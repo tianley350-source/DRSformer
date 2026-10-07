@@ -146,6 +146,56 @@ class ImageCleanModel(BaseModel):
         if 'gt' in data:
             self.gt = data['gt'].to(self.device)
 
+    def _resolve_intermediate_weights(self, current_iter, num_predictions):
+        """Return auxiliary/final loss weights for the current iteration."""
+        if num_predictions < 1:
+            raise ValueError('num_predictions must be at least one.')
+
+        configured = self.opt['train'].get('intermediate_weights')
+        schedule = self.opt['train'].get('intermediate_weight_schedule')
+        if schedule is not None and num_predictions > 1:
+            start_iter = int(schedule.get('start_iter', 0))
+            end_iter = int(schedule['end_iter'])
+            if end_iter <= start_iter:
+                raise ValueError(
+                    'intermediate_weight_schedule.end_iter must be greater '
+                    'than start_iter.')
+            progress = ((float(current_iter) - start_iter) /
+                        (end_iter - start_iter))
+            progress = min(1.0, max(0.0, progress))
+            schedule_type = schedule.get('type', 'cosine').lower()
+            if schedule_type == 'cosine':
+                blend = 0.5 * (1.0 - np.cos(np.pi * progress))
+            elif schedule_type == 'linear':
+                blend = progress
+            else:
+                raise ValueError(
+                    'intermediate_weight_schedule.type must be cosine or '
+                    f'linear, got {schedule_type}.')
+
+            initial = float(schedule.get('initial', 0.1))
+            final = float(schedule.get('final', 0.0))
+            auxiliary_weight = initial + (final - initial) * blend
+            if 'final_output' in schedule:
+                final_weight = float(schedule['final_output'])
+            elif configured is not None:
+                final_weight = float(configured[-1])
+            else:
+                final_weight = 1.0
+            return ([auxiliary_weight] * (num_predictions - 1) +
+                    [final_weight])
+
+        if configured is None:
+            return [1.0] * num_predictions
+        if len(configured) < num_predictions:
+            raise ValueError(
+                f'intermediate_weights has {len(configured)} entries, but '
+                f'the network returned {num_predictions} predictions.')
+        # Random-depth training may return fewer intermediate predictions.
+        # Keep the final configured weight for the full decoder output.
+        return (list(configured[:num_predictions - 1]) +
+                [configured[-1]])
+
     def optimize_parameters(self, current_iter):
         self.optimizer_g.zero_grad()
         preds = self.net_g(self.lq)
@@ -157,18 +207,8 @@ class ImageCleanModel(BaseModel):
         loss_dict = OrderedDict()
         # pixel loss
         l_pix = 0.
-        intermediate_weights = self.opt['train'].get('intermediate_weights')
-        if intermediate_weights is None:
-            loss_weights = [1.0] * len(preds)
-        else:
-            if len(intermediate_weights) < len(preds):
-                raise ValueError(
-                    f'intermediate_weights has {len(intermediate_weights)} '
-                    f'entries, but the network returned {len(preds)} predictions.')
-            # Random-depth training may return fewer intermediate predictions.
-            # Keep the final configured weight for the full decoder output.
-            loss_weights = (list(intermediate_weights[:len(preds) - 1]) +
-                            [intermediate_weights[-1]])
+        loss_weights = self._resolve_intermediate_weights(
+            current_iter, len(preds))
 
         for weight, pred in zip(loss_weights, preds):
             l_pix += float(weight) * self.cri_pix(pred, self.gt)
