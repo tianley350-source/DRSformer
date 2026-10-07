@@ -93,7 +93,7 @@ train:
 
 val:
   window_size: 8
-  val_freq: 2500
+  val_freq: 5000
   save_img: false
   rgb2bgr: true
   use_image: true
